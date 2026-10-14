@@ -117,10 +117,13 @@ os.environ["GITHUB_TOKEN"] = userdata.get("GITHUB_TOKEN")
 !git config user.name "<Họ tên>"
 !git config user.email "<email-github>"
 # token chỉ nằm trong .git/config của runtime Colab (không commit); đừng in ra
+# GH_USER và GH_REPO phải đã được gán ở trên, nếu không remote sẽ chứa chữ {GH_USER}
 !git remote set-url origin https://$GITHUB_TOKEN@github.com/{GH_USER}/{GH_REPO}.git
 !git pull origin main
 # work/ -> Drive: adapter và dự đoán sống sót qua các lần ngắt session
 !mkdir -p /content/drive/MyDrive/lab_day10/work && ln -sfn /content/drive/MyDrive/lab_day10/work work
+# `work/` trong .gitignore chỉ khớp THƯ MỤC, không khớp symlink `work` → phải loại riêng, nếu không `git add -A` sẽ commit symlink
+!grep -qx work .git/info/exclude || echo work >> .git/info/exclude
 !ls -la work | head -3
 ```
 
@@ -130,6 +133,7 @@ os.environ["GITHUB_TOKEN"] = userdata.get("GITHUB_TOKEN")
 
 ```python
 !pip -q install -r requirements-colab.txt
+!pip -q uninstall -y torchao      # Colab cài sẵn torchao cũ (0.10) làm peft 0.21 báo ImportError; bài lab không dùng
 !python scripts/prepare_data.py --kaggle --work /content/raw
 !python -m pytest -q
 ```
@@ -151,7 +155,7 @@ def push(msg):
         print(r.stdout + r.stderr)
 ```
 
-Trước khi `push`, kiểm tra `!git status --short`: không được có `data/`, `work/`, `.env`, `*.safetensors`, `*.bin`, `*.pt` (đã nằm trong `.gitignore`). `work/` là symlink sang Drive nên không bị add.
+Trước khi `push`, kiểm tra `!git status --short`: không được có `data/`, `work/`, `.env`, `*.safetensors`, `*.bin`, `*.pt` (đã nằm trong `.gitignore`). `work` (symlink sang Drive) được loại bằng `.git/info/exclude` ở ô 2.1; nếu `git status` vẫn hiện `work`, chạy lại dòng `echo work >> .git/info/exclude`.
 
 ---
 
@@ -159,7 +163,14 @@ Trước khi `push`, kiểm tra `!git status --short`: không được có `data
 
 ```python
 import json
-from labsrc.data import load_split, load_image   # chỉ PIL, không kéo torch
+from PIL import Image
+
+def load_split(name):          # bước 2 sẽ có bản chính thức trong labsrc/data.py
+    with open(f"data/splits/{name}.jsonl", encoding="utf-8") as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+def load_image(e):
+    return Image.open(f"data/{e['image_path']}").convert("RGB")
 
 meta = json.load(open("data/splits/meta.json"))
 print("dataset_version:", meta["dataset_version"])
@@ -170,7 +181,7 @@ for s, c in meta["counts"].items():
     print(s, c["images"], "ảnh", c["boxes"])
 ```
 
-Vẽ 6 ảnh có box (dùng lại ở bước 2 để đối chiếu):
+Vẽ 6 ảnh có box (ô này dùng lại `load_split`/`load_image` vừa định nghĩa ở trên, nên chạy ô trên trước):
 
 ```python
 import matplotlib.pyplot as plt
@@ -314,12 +325,25 @@ LLM_RE = r"model\.language_model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(
 VIT_RE = r"model\.visual\.blocks\.\d+\.(attn\.(qkv|proj)|mlp\.(linear_fc1|linear_fc2))"
 
 
+# "visual" một mình KHÔNG đủ trên transformers 5.19: merger/deepstack vẫn bị nén 4-bit (đã đo),
+# nên liệt kê cả tên đầy đủ có tiền tố "model."
+SKIP_QUANT = ["visual", "model.visual", "visual.merger", "visual.deepstack_merger_list", "lm_head"]
+
+
+def assert_vit_not_quantized(model):
+    import bitsandbytes as bnb
+    bad = [n for n, m in model.named_modules()
+           if isinstance(m, bnb.nn.Linear4bit) and "visual" in n.split(".")]
+    assert not bad, f"{len(bad)} Linear trong ViT vẫn bị lượng tử hoá 4-bit, ví dụ: {bad[:3]}"
+
+
 def load_model():
     quant = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True, llm_int8_skip_modules=["visual", "lm_head"])
+        bnb_4bit_use_double_quant=True, llm_int8_skip_modules=SKIP_QUANT)
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         MODEL_ID, quantization_config=quant, dtype=torch.float16, device_map={"": 0})
+    assert_vit_not_quantized(model)
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     processor.tokenizer.padding_side = "left"
     return model, processor
@@ -805,6 +829,74 @@ Mong đợi: `348 module LoRA`, loss hữu hạn, không OOM, `run.json` và `ex
 
 Xoá bản thử: `!rm -rf work/adapters/smoke work/dbg_smoke.jsonl`.
 
+### Ô 6.3: chẩn đoán dtype và lượng tử hoá (chạy khi gặp `Attempting to unscale FP16 gradients` hoặc số tham số lạ)
+
+```python
+%%writefile labsrc/debug_dtype.py
+"""Chẩn đoán dtype/lượng tử hoá của ViT + projector, và lỗi 'Attempting to unscale FP16 gradients'."""
+import collections
+
+import torch
+import yaml
+
+from .data import load_image, load_split, make_prompt, objects_to_answer
+from .modeling import PROJ_KEYS, apply_setup, collate, encode_example, load_model
+
+cfg = yaml.safe_load(open("configs/e3.yaml", encoding="utf-8"))
+model, processor = load_model()          # assert_vit_not_quantized chạy trong load_model
+inner = model.model
+for label, mod in (("visual.blocks[0].attn.qkv", inner.visual.blocks[0].attn.qkv),
+                   ("visual.merger.linear_fc1", inner.visual.merger.linear_fc1),
+                   ("language_model q_proj", inner.language_model.layers[0].self_attn.q_proj),
+                   ("lm_head", model.lm_head)):
+    print(f"{label:28s} {type(mod).__name__:12s} weight={mod.weight.dtype} numel={mod.weight.numel():,}")
+model, n_matched = apply_setup(model, cfg)
+
+
+def group(name):
+    if "lora_" in name:
+        return "lora_vit" if ".visual." in name else "lora_llm"
+    return next((k for k in PROJ_KEYS if k in name), "khác")
+
+
+train, frozen = collections.defaultdict(lambda: [0, collections.Counter()]), collections.Counter()
+for name, p in model.named_parameters():
+    g = group(name)
+    if p.requires_grad:
+        train[g][0] += p.numel()
+        train[g][1][str(p.dtype)] += 1
+    elif g in PROJ_KEYS:
+        frozen[g] += p.numel()
+print("--- tham số ĐANG huấn luyện theo nhóm (số lượng, {dtype: số tensor}) ---")
+for g, (num, c) in train.items():
+    print(f"{g:30s} {num:>13,} {dict(c)}")
+print("tổng:", sum(v[0] for v in train.values()), "| projector còn bị đóng băng:", dict(frozen))
+
+e = load_split("train")[0]
+ans = objects_to_answer(e["objects"], width=e["width"], height=e["height"])
+batch = collate([encode_example(processor, load_image(e), make_prompt(), ans)], processor.tokenizer.pad_token_id)
+batch = {k: v.to("cuda") for k, v in batch.items()}
+model.train()
+with torch.autocast("cuda", dtype=torch.float16):
+    loss = model(**batch).loss
+loss.backward()
+bad = [(n, str(p.dtype), str(p.grad.dtype)) for n, p in model.named_parameters()
+       if p.grad is not None and p.grad.dtype != torch.float32]
+print("tham số có grad không phải fp32:", len(bad))
+for x in bad[:10]:
+    print("  ", x)
+nograd = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+print("requires_grad nhưng không có grad:", len(nograd), nograd[:5])
+```
+
+```python
+!python -m labsrc.debug_dtype
+```
+
+Kết quả đúng: `qkv`, `merger.linear_fc1` và `lm_head` đều là `Linear` (không phải `Linear4bit`) với `weight=torch.float16`; `visual.merger.linear_fc1` có `numel=16,777,216`; E3 có tổng ≈ 148,6M tham số huấn luyện (LoRA LLM 33,0M + LoRA ViT 6,3M + merger 27,3M + deepstack ≈ 82M); "tham số có grad không phải fp32: 0".
+
+**Sự cố đã gặp:** `llm_int8_skip_modules=["visual","lm_head"]` (đúng như GUIDE) **không** loại ViT/projector khỏi lượng tử hoá trên `transformers==5.19.0`: `merger` chỉ còn một nửa số phần tử (trọng số nén 4-bit), trọng số không có gradient, và bitsandbytes tự cast bias về fp16 nên GradScaler báo "Attempting to unscale FP16 gradients". `load_model` đã dùng `SKIP_QUANT` (có thêm `model.visual`, `visual.merger`, `visual.deepstack_merger_list`) và `assert_vit_not_quantized` để bắt lỗi này ngay lúc nạp. **Mọi kết quả E0 chạy bằng bản `load_model` cũ phải chạy lại** (xoá `work/e0.jsonl`, `work/dbg_e0_val40.jsonl`).
+
 Commit: `push("feat: mã huấn luyện/suy luận")`
 
 ---
@@ -826,7 +918,7 @@ Với **mỗi** setup, chạy lần lượt 3 ô (ví dụ E1; E2 và E3 đổi 
 
 ```python
 # (a) huấn luyện ≈ 20–30 phút; giữ tab Colab mở
-!python -m labsrc.train --config configs/e1.yaml --out work/adapters/e1
+!PYTORCH_ALLOC_CONF=expandable_segments:True python -m labsrc.train --config configs/e1.yaml --out work/adapters/e1 --batch-size 1 --grad-accum 8
 ```
 ```python
 # (b) suy luận test (≈ 10–15 phút)
@@ -844,12 +936,12 @@ cmd = score_cmd("E1", "e1")
 - E2/E3: log suy luận có dòng "đã nạp lại N tensor projector". Nếu F1 của E2/E3 **giống hệt** E1 thì nhiều khả năng projector chưa được nạp.
 - `trainable_params` của E2 lớn hơn E1 khoảng **109M**; E3 có **348** module LoRA.
 
-Nếu OOM ở E3: `--batch-size 1 --grad-accum 8` (giữ tích 8, ghi chú vào báo cáo; **đừng sửa `configs/*.yaml`**, test của đề kiểm tra các config chỉ khác nhau đúng biến thí nghiệm).
+**Dùng `--batch-size 1 --grad-accum 8` cho MỌI lần train (E1–E4)**: với batch 2 ảnh, T4 bị `CUDA out of memory` ngay ở phép tính loss khi gặp ảnh có nhiều box (đáp án JSON dài, logits 151.936 từ × độ dài chuỗi × fp32). Số ảnh mỗi bước tối ưu vẫn là 8 như cấu hình gốc. Phải dùng **cùng** giá trị cho cả bốn setup để so sánh công bằng, và ghi rõ trong báo cáo (`run.json` đã lưu `batch_size`, `grad_accum`). **Đừng sửa `configs/*.yaml`**: test của đề kiểm tra các config chỉ khác nhau đúng biến thí nghiệm. `PYTORCH_ALLOC_CONF=expandable_segments:True` giảm phân mảnh bộ nhớ.
 
 Chạy dài, nên chạy nền và theo dõi log để sống sót khi trình duyệt chập chờn:
 
 ```python
-!nohup python -m labsrc.train --config configs/e1.yaml --out work/adapters/e1 > work/train_e1.log 2>&1 &
+!PYTORCH_ALLOC_CONF=expandable_segments:True nohup python -m labsrc.train --config configs/e1.yaml --out work/adapters/e1 --batch-size 1 --grad-accum 8 > work/train_e1.log 2>&1 &
 !tail -n 5 work/train_e1.log     # chạy lại lệnh này để xem tiến độ
 ```
 
@@ -875,18 +967,24 @@ Chọn **một** biến, đổi **đúng một thứ** so với setup tốt nh�
 
 ```python
 # giá trị 0.1: train lại với 10% ảnh train (≈ 142 ảnh, vẫn 300 bước)
-!python -m labsrc.train --config configs/e2.yaml --out work/adapters/e4_data_size_0.1 --train-fraction 0.1
+!PYTORCH_ALLOC_CONF=expandable_segments:True python -m labsrc.train --config configs/e2.yaml --out work/adapters/e4_data_size_0.1 --train-fraction 0.1 --batch-size 1 --grad-accum 8
 !python -m labsrc.infer --adapter work/adapters/e4_data_size_0.1 --out work/e4_data_size_0.1.jsonl
 ```
 ```python
-r = json.load(open("work/adapters/e4_data_size_0.1/run.json"))
-meta = " ".join(f"--meta {k}={r[k]}" for k in ("trainable_params", "peak_vram_gb", "train_minutes"))
+import json
+best = "e2"      # đổi thành setup có F1 cao nhất trong E1-E3 (kết quả thật của bạn)
+
+def meta_args(key):
+    r = json.load(open(f"work/adapters/{key}/run.json"))
+    return " ".join(f"--meta {k}={r[k]}" for k in ("trainable_params", "peak_vram_gb", "train_minutes"))
+
+# giá trị 0.1: dự đoán và adapter vừa train
+meta = meta_args("e4_data_size_0.1")
 !python scripts/score.py --pred work/e4_data_size_0.1.jsonl --name E4_data_0.1 --out report/evidence/e4_data_size_0.1.json {meta}
 
-# giá trị 1.0 chính là setup gốc (ở đây giả sử là e2): dùng lại dự đoán của nó
-!cp work/e2.jsonl work/e4_data_size_1.0.jsonl
-r = json.load(open("work/adapters/e2/run.json"))
-meta = " ".join(f"--meta {k}={r[k]}" for k in ("trainable_params", "peak_vram_gb", "train_minutes"))
+# giá trị 1.0 chính là setup gốc: dùng lại dự đoán của nó (phải trùng config đã dùng để train bản 0.1)
+!cp work/{best}.jsonl work/e4_data_size_1.0.jsonl
+meta = meta_args(best)
 !python scripts/score.py --pred work/e4_data_size_1.0.jsonl --name E4_data_1.0 --out report/evidence/e4_data_size_1.0.json {meta}
 ```
 
@@ -1081,9 +1179,10 @@ Mục **"Nhìn lại"** của `REPORT.md`: viết một điều bạn thật s�
 | `kaggle` 401/403 | secret sai, chưa bật Notebook access | kiểm tra `KAGGLE_USERNAME`/`KAGGLE_KEY`; hoặc tải zip bằng tay rồi `!python scripts/prepare_data.py --zip /content/drive/MyDrive/<file>.zip` |
 | Mất session giữa chừng | Colab free ngắt | chạy lại ô 2.1–2.2; adapter/dự đoán còn trên Drive; `labsrc.infer` chạy tiếp được; huấn luyện phải chạy lại từ đầu (mã tham chiếu lưu mỗi 100 bước nhưng không có chế độ resume) |
 | Hết hạn mức GPU | giới hạn của Colab free | chờ hoặc dùng tài khoản khác; lưu Drive trước |
-| `CUDA out of memory` | batch lớn, E3 nặng nhất | `--batch-size 1 --grad-accum 8`; khởi động lại runtime để xoá VRAM; xác nhận gradient checkpointing đã bật |
+| `CUDA out of memory` (thường ở phép tính loss) | batch 2 ảnh gặp ảnh nhiều box → chuỗi dài, logits fp32 rất lớn | `--batch-size 1 --grad-accum 8` và `PYTORCH_ALLOC_CONF=expandable_segments:True` (đã có sẵn trong các lệnh train); khởi động lại runtime nếu VRAM còn bị giữ; nếu batch 1 vẫn OOM, hãy báo để đổi cách tính loss chỉ trên vị trí đáp án |
 | Loss `nan`/`inf` | tràn số fp16 | `train.py` dừng và báo; thử `--batch-size 1 --grad-accum 8`, kiểm tra mask |
 | `Attempting to unscale FP16 gradients` | có tham số huấn luyện còn fp16 | kiểm tra `apply_setup` ép fp32 đúng tên (`visual.merger`, `visual.deepstack_merger_list`) |
+| `ImportError: Found an incompatible version of torchao` (khi `get_peft_model`) | Colab có sẵn `torchao` cũ, `peft` yêu cầu ≥ 0.16 | `!pip -q uninstall -y torchao` (không cần restart vì mọi bước chạy trong tiến trình riêng) |
 | `Target modules ... not found` hoặc số module ≠ 252/348 | tên module khác tên trong GUIDE | `!python -m labsrc.count_params`; in `[n for n,_ in model.named_modules()]` rồi chỉnh `LLM_RE`/`VIT_RE` |
 | `KeyError` khi nạp projector | tên tham số lúc lưu ≠ lúc nạp | cả hai dùng `model.named_parameters()` của **PeftModel**; đừng lưu từ model chưa bọc peft |
 | F1 E2/E3 = E1 chính xác | quên nạp lại projector | tìm dòng "đã nạp lại N tensor projector" trong log suy luận; kiểm tra `extra_trainable.pt` có trong thư mục adapter |
