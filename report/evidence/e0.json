@@ -1,28 +1,59 @@
 {
+  "n_images": 311,
+  "parse_valid_rate": 0.909967845659164,
+  "missing_predictions": 0,
+  "micro": {
+    "precision": 0.11666666666666667,
+    "recall": 0.060034305317324184,
+    "f1": 0.07927519818799547,
+    "tp": 35,
+    "fp": 265,
+    "fn": 548
+  },
+  "per_class": {
+    "pothole": {
+      "precision": 0.4,
+      "recall": 0.09917355371900827,
+      "f1": 0.15894039735099338,
+      "tp": 12,
+      "fp": 18,
+      "fn": 109
+    },
+    "crack": {
+      "precision": 0.031088082901554404,
+      "recall": 0.020066889632107024,
+      "f1": 0.024390243902439025,
+      "tp": 6,
+      "fp": 187,
+      "fn": 293
+    },
+    "manhole": {
+      "precision": 0.22077922077922077,
+      "recall": 0.10429447852760736,
+      "f1": 0.14166666666666666,
+      "tp": 17,
+      "fp": 60,
+      "fn": 146
+    },
+    "other": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0
+    }
+  },
+  "mean_iou": 0.616274852867036,
+  "fp_per_image": 0.8520900321543409,
+  "f1_ci95": [
+    0.05473204104903079,
+    0.10804851157662625
+  ],
   "score_version": 1,
   "name": "E0",
   "dataset_version": "d10-21e4070301",
   "split": "test",
   "coord": "norm1000",
-  "n_images": 311,
-  "parse_valid_rate": 0.94,
-  "missing_predictions": 0,
-  "micro": {
-    "precision": 0.131,
-    "recall": 0.129,
-    "f1": 0.13,
-    "tp": 128,
-    "fp": 216,
-    "fn": 152
-  },
-  "per_class": {
-    "pothole": {"precision": 0.11, "recall": 0.1, "f1": 0.1, "tp": 17, "fp": 32, "fn": 25},
-    "crack": {"precision": 0.19, "recall": 0.17, "f1": 0.18, "tp": 70, "fp": 40, "fn": 55},
-    "manhole": {"precision": 0.13, "recall": 0.12, "f1": 0.12, "tp": 29, "fp": 24, "fn": 33},
-    "other": {"precision": 0.0, "recall": 0.0, "f1": 0.0, "tp": 0, "fp": 0, "fn": 0}
-  },
-  "mean_iou": 0.246,
-  "fp_per_image": 0.693,
-  "f1_ci95": [0.1, 0.18],
   "meta": {}
 }
