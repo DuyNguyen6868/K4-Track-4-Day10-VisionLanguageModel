@@ -1,31 +1,56 @@
-"""Utilities for converting YOLO labels and building training prompts.
-
-These helpers mirror the lab pseudocode described in GUIDE.md and COLAB_GUIDE.md.
-The functions are intentionally lightweight and framework-agnostic so they can run
-outside the full GPU training environment.
-"""
-
-from __future__ import annotations
-
+"""Nhãn, prompt và đọc split (không phụ thuộc torch)."""
 import json
-from typing import Iterable, Dict, Any
+import random
+from pathlib import Path
+
+from PIL import Image
+
+DATA = Path("data")
+CLASSES = ("pothole", "crack", "manhole")
 
 
-def yolo_to_box(label: str, yolo: Iterable[float]) -> Dict[str, Any]:
-    """Convert normalized YOLO box to a 0-1000 grounding box."""
-    xc, yc, w, h = (float(v) for v in yolo)
-    x1 = max(0.0, min(1000.0, (xc - w / 2.0) * 1000.0))
-    y1 = max(0.0, min(1000.0, (yc - h / 2.0) * 1000.0))
-    x2 = max(0.0, min(1000.0, (xc + w / 2.0) * 1000.0))
-    y2 = max(0.0, min(1000.0, (yc + h / 2.0) * 1000.0))
-    return {
-        "label": label,
-        "bbox_2d": [round(x1), round(y1), round(x2), round(y2)],
-    }
+def read_jsonl(path):
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
 
 
-def objects_to_answer(objects: Iterable[Dict[str, Any]]) -> str:
-    """Serialize a list of object annotations in stable reading order."""
-    boxes = [yolo_to_box(obj["label"], obj["yolo"]) for obj in objects]
-    boxes.sort(key=lambda box: (box["bbox_2d"][1], box["bbox_2d"][0]))
-    return json.dumps(boxes, separators=(",", ":")) if boxes else "[]"
+def load_split(name, limit=None, fraction=1.0, seed=42):
+    rows = read_jsonl(DATA / "splits" / f"{name}.jsonl")
+    if fraction < 1.0:
+        rows = random.Random(seed).sample(rows, int(len(rows) * fraction))
+    return rows[:limit] if limit else rows
+
+
+def load_image(entry):
+    return Image.open(DATA / entry["image_path"]).convert("RGB")
+
+
+def make_prompt(coord="norm1000", width=640, height=360):
+    if coord == "norm1000":
+        scale = ("Coordinates are integers on a 0-1000 scale relative to the image width and height "
+                 "((0,0) = top-left, (1000,1000) = bottom-right).")
+    else:
+        scale = (f"Coordinates are integer pixels of the {width}x{height} image "
+                 f"(x in 0-{width}, y in 0-{height}).")
+    return ("Detect all road damage in this dashcam image. Classes: pothole, crack, manhole. "
+            'Answer with ONLY a JSON list, no other text: [{"label": "<class>", "bbox_2d": [x1, y1, x2, y2]}]. '
+            f"{scale} Answer [] if there is no damage.")
+
+
+def yolo_to_box(label, yolo, coord="norm1000", width=640, height=360):
+    sx, sy = (1000, 1000) if coord == "norm1000" else (width, height)
+    xc, yc, w, h = yolo
+
+    def clamp(v, hi):
+        return int(min(max(round(v), 0), hi))
+
+    x1, y1 = clamp((xc - w / 2) * sx, sx), clamp((yc - h / 2) * sy, sy)
+    x2, y2 = clamp((xc + w / 2) * sx, sx), clamp((yc + h / 2) * sy, sy)
+    # box suy biến (x2 <= x1) bị score.py coi là JSON hỏng, nên ép tối thiểu 1 đơn vị
+    return {"label": label, "bbox_2d": [x1, y1, max(x2, x1 + 1), max(y2, y1 + 1)]}
+
+
+def objects_to_answer(objects, coord="norm1000", width=640, height=360):
+    boxes = [yolo_to_box(o["label"], o["yolo"], coord, width, height) for o in objects]
+    boxes.sort(key=lambda b: (b["bbox_2d"][1], b["bbox_2d"][0]))  # trên→dưới, trái→phải
+    return json.dumps(boxes, separators=(",", ":"))
