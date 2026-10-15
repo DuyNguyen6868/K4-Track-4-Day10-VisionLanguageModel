@@ -116,9 +116,13 @@ os.environ["GITHUB_TOKEN"] = userdata.get("GITHUB_TOKEN")
 %cd /content/{GH_REPO}
 !git config user.name "<Họ tên>"
 !git config user.email "<email-github>"
-# token chỉ nằm trong .git/config của runtime Colab (không commit); đừng in ra
-# GH_USER và GH_REPO phải đã được gán ở trên, nếu không remote sẽ chứa chữ {GH_USER}
-!git remote set-url origin https://$GITHUB_TOKEN@github.com/{GH_USER}/{GH_REPO}.git
+# Ghép URL có token bằng Python, KHÔNG viết `!git ... $GITHUB_TOKEN ...{GH_USER}`: trên một dòng `!`,
+# IPython thấy $GITHUB_TOKEN không phải biến Python nên bỏ qua MỌI phép thay {...} của dòng đó
+# → remote thành chữ "{GH_USER}" → "Repository not found". Token chỉ nằm trong .git/config của runtime.
+import subprocess
+remote = f"https://{os.environ['GITHUB_TOKEN']}@github.com/{GH_USER}/{GH_REPO}.git"
+subprocess.run(["git", "remote", "set-url", "origin", remote], check=True)
+!git remote get-url origin | sed -E 's#//[^@]+@#//***@#'
 !git pull origin main
 # work/ -> Drive: adapter và dự đoán sống sót qua các lần ngắt session
 !mkdir -p /content/drive/MyDrive/lab_day10/work && ln -sfn /content/drive/MyDrive/lab_day10/work work
@@ -1176,6 +1180,7 @@ Mục **"Nhìn lại"** của `REPORT.md`: viết một điều bạn thật s�
 | Triệu chứng | Nguyên nhân thường gặp | Xử lý |
 |---|---|---|
 | `ImportError ... requires the Torchvision library` | thiếu `torchvision` cùng bản torch của Colab | `!pip -q install torchvision` (không ghim bản khác torch), chạy lại |
+| `fatal: repository 'https://github.com/{GH_USER}/{GH_REPO}.git/' not found` | dòng `!` có cả `$TÊN_BIẾN_MÔI_TRƯỜNG` lẫn `{biến_python}`: IPython không tìm thấy `$…` trong Python nên bỏ qua toàn bộ phép thay `{…}` trên dòng đó | ghép chuỗi bằng Python rồi gọi `subprocess.run([...])` (như ô 2.1); hoặc chỉ dùng một kiểu trên mỗi dòng `!` |
 | `kaggle` 401/403 | secret sai, chưa bật Notebook access | kiểm tra `KAGGLE_USERNAME`/`KAGGLE_KEY`; hoặc tải zip bằng tay rồi `!python scripts/prepare_data.py --zip /content/drive/MyDrive/<file>.zip` |
 | Mất session giữa chừng | Colab free ngắt | chạy lại ô 2.1–2.2; adapter/dự đoán còn trên Drive; `labsrc.infer` chạy tiếp được; huấn luyện phải chạy lại từ đầu (mã tham chiếu lưu mỗi 100 bước nhưng không có chế độ resume) |
 | Hết hạn mức GPU | giới hạn của Colab free | chờ hoặc dùng tài khoản khác; lưu Drive trước |
